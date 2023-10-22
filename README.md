@@ -7,4 +7,4 @@ You don't have to use anything from this repo to get games running as these are 
 
 That being said part of a guide listed at pages may be harder to follow without any system integration whatsoever, therefore this repository exists, providing the minimal wrappers setup that should work with guide provided.              
 
-If it doesn't, create a new issue here, as I may have forgotten to update some wrappers here.                
+If it doesn't, create a new issue here, as some wrappers here may be outdated.                

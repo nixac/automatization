@@ -1,0 +1,11 @@
+--- upstream/proton
++++ mod/proton
+@@ -1462,6 +1462,8 @@
+         prepend_to_env_str(self.env, ld_path_var, g_proton.lib64_dir + ":" + g_proton.lib_dir, ":")
+ 
+         self.env["WINEDLLPATH"] = g_proton.lib64_dir + "/wine:" + g_proton.lib_dir + "/wine"
++        if len(os.getenv("WINEDLLPATH") or ""):
++            self.env["WINEDLLPATH"] = os.getenv("WINEDLLPATH").strip(":") + ":" + self.env["WINEDLLPATH"]
+ 
+         self.env["GST_PLUGIN_SYSTEM_PATH_1_0"] = g_proton.lib64_dir + "gstreamer-1.0" + ":" + g_proton.lib_dir + "gstreamer-1.0"
+         self.env["WINE_GST_REGISTRY_DIR"] = g_compatdata.path("gstreamer-1.0/")
