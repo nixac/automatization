@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# Minified version
+
+_C_scriptName="$(basename -- "$(realpath -- "$0")")"
+_C_scriptDir="$(dirname -- "$(realpath -- "$0")")"
+_C_rootDir="$(dirname -- "$_C_scriptDir")"
+_G_runtime=""
+_G_prefix=""
+_G_exec=""
+_G_args=""
+_G_root=""
+_G_steamlib=("$HOME/.local/share/Steam")
+_G_runmode=()
+
+print_help() {
+  cat <<EOF
+ep_nix:ver:proton
+Usage: ${_C_scriptName} [EXiV] [opt-args]
+Available arguments:
+--runtime     path to proton runtime dir root
+--prefix      path to proton compatdata appid dir root (proton specific wine prefix)
+--exec        windows binary entry point path (for advanced uses look below)
+--args        args to provide exec binary (this input is not sanitized and follows escape rules of shell so to pass "val with space" use --args "-arg \"arg with space\"")
+--root        windows game root (if not set uses working directory)
+--uniqueid    provide to enable fixes for specific AppID (must be numeric, overrides detected AppID if any, for custom id use 0 padded 10 digit ID ex. custom 21 0000000021 to evade SteamID clashes)
+--steam-dir   provide each additional steam library roots (with valid libraryfolder.vdf in root)
+--async       enable simultaneous execution inside the same prefix (uses run instead waitforexitandrun)
+--info-hud    enable information overlay (provided through mangohud)
+--local-only  disable internet access
+--srpt        enable steam remote play together through spoofing the game, needs appid of game chosen as dummy (installed and configured to use helper_steamct as compatibility tool)
+-h
+--help        show help
+
+--exec advanced usage (by value):
+eg://             protocol to trigger epic games store simplification wrapper (via legendary)
+eg://<APP-ID>     APP-ID as used internally by legendary (obtainable through list, App name entry)
+eg://by-title/<MATCH-STRING>
+                  MATCH-STRING used to find first matched APP-ID for this title
+st://             protocol to trigger steam store simplification wrapper (directly launching games)
+EOF
+}
+
+arg_parse() {
+  #echo $PROTON_NO_D3D11
+  echo "$@"
+  while [ ! -z ${1+x} ]; do
+    case "$1" in
+    --help | -h)
+      shift
+      print_help
+      exit 0
+      ;;
+    --runtime)
+      shift
+      : ${_G_runtime:="${1%/}"}
+      shift
+      ;;
+    --steam-dir)
+      shift
+      _G_steamlib+=("${1%/}")
+      shift
+      ;;
+    --prefix)
+      shift
+      : ${_G_prefix:="${1%/}"}
+      shift
+      ;;
+    --exec)
+      shift
+      : ${_G_exec:="${1%/}"}
+      if [[ "${_G_exec}" == "eg://"* ]]; then
+        _G_exec="${_G_exec:5}"
+        _G_runmode+=('__exec_eg')
+      fi
+      shift
+      ;;
+    --args)
+      shift
+      : ${_G_args:="${1}"}
+      shift
+      ;;
+    --root)
+      shift
+      : ${_G_root:="${1%/}"}
+      shift
+      ;;
+    --uniqueid)
+      shift
+      [ -z "${1##*[!0-9]*}" ] || export STEAM_COMPAT_APP_ID="$1"
+      shift
+      ;;
+    --async)
+      _G_runmode+=('__async')
+      shift
+      ;;
+    --srpt)
+      _G_runmode+=('__srpt')
+      shift
+      shift
+      ;;
+    --info-hud)
+      shift
+      _G_runmode+=('__mango')
+      ;;
+    --local-only)
+      shift
+      _G_runmode+=('__local')
+      ;;
+    --no-debug)
+      shift
+      _G_runmode+=('__silent')
+      ;;
+    --dry-run)
+      shift
+      _G_runmode+=('__dry')
+      ;;
+    "")
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1"
+      exit 2
+      shift
+      ;;
+    esac
+  done
+}
+
+# Finds path where steamapp has been installed (first occurence)
+find_steamapp() {
+  for el in "${_G_steamlib[@]}"; do
+    elParse="$el/steamapps/common/$1"
+    if [ -d "$elParse" ]; then
+      printf "$elParse"
+    fi
+  done
+}
+
+setup_legendary() {
+  # Adjust exec line to represent Epic Games app name based on protocol extension
+  if [[ "${_G_exec}" == "by-title/"* ]]; then
+    _G_exec="${_G_exec:9}"
+    _G_exec="$(/opt/Heroic/resources/app.asar.unpacked/build/bin/linux/legendary list | grep -m 1 -i -- "${_G_exec}" | grep -Po '^.*?\K(?<=App name: ).*?(?= | Version)')"
+  fi
+
+  # Adjust execution to use legendary wrappers
+  prefix="$prefix /opt/Heroic/resources/app.asar.unpacked/build/bin/linux/legendary launch $_G_exec --no-wine --wrapper \"" # add --dry-run before --no-wine to test
+  _G_exec=""
+  suffix="\" $suffix"
+
+}
+
+setup_srpt() {
+  routeappid="0"
+  args=()
+  while [ ! -z ${1+x} ]; do
+    case "$1" in
+    --srpt)
+      shift
+      [ -z "${1##*[!0-9]*}" ] || routeappid="$1"
+      [ "$routeappid" -ne "0" ] || routeappid="1860860"
+      shift
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
+    esac
+  done
+  #echo steam -applaunch "$routeappid" ep_protonnix --cd "$(pwd)" "${args[@]}"
+  exec steam -applaunch "$routeappid" ep_protonnix --cd "$(pwd)" "${args[@]}"
+  exit 0
+}
+
+# Disable network access
+setup_network_block() {
+  # no systemd (gamemode fails dbus connection, since permissions)
+  if pidof systemd; then
+    prefix="systemd-run --scope -p IPAddressDeny=any ${prefix}"
+  else
+    prefix="unshare -r -n ${prefix}"
+  fi
+  #print_log INFO "Disabling network access"
+}
+
+# Setup steam variables
+setup_environment() {
+  # Steam
+  if [ -n "$STEAM_COMPAT_MOUNTS" ]; then STEAM_COMPAT_MOUNTS="$STEAM_COMPAT_MOUNTS:"; fi # preserve preset additional mounts if any
+  export STEAM_COMPAT_MOUNTS="${STEAM_COMPAT_MOUNTS}$(find_steamapp "Steamworks Shared"):$_G_runtime:$(find_steamapp "SteamLinuxRuntime_soldier"):$(find_steamapp "Proton EasyAntiCheat Runtime")"
+  [ -z "${STEAM_COMPAT_APP_ID}" ] && export STEAM_COMPAT_APP_ID="${_G_prefix##*/}" # truncate to string after last occurence of /
+  [ -z "${STEAM_COMPAT_APP_ID##*[!0-9]*}" ] && export STEAM_COMPAT_APP_ID=0 # set to null if not numeric
+  export SteamAppId="$STEAM_COMPAT_APP_ID"
+  export SteamGameId="$STEAM_COMPAT_APP_ID"
+  export STEAM_COMPAT_INSTALL_PATH="$(realpath -- "$PWD")"
+  export STEAM_COMPAT_DATA_PATH="$_G_prefix"
+  export STEAM_COMPAT_SHADER_PATH="${_G_steamlib[${#_G_steamlib[@]} - 1]}/steamapps/shadercache/${_G_prefix##*/}" # ..../steam/steamapps/shadercache/739630
+  export STEAM_COMPAT_CLIENT_INSTALL_PATH="$HOME/.local/share/Steam/"
+  export STEAM_COMPAT_TOOL_PATHS="$_G_runtime:$(find_steamapp "SteamLinuxRuntime_soldier")" #:$(find_steamapp "Proton EasyAntiCheat Runtime")"
+
+  # Proton
+  : ${DXVK_STATE_CACHE:=1}
+  export DXVK_STATE_CACHE
+  : ${DXVK_ASYNC:=1}
+  unset DXVK_ASYNC # removed as of GE-Proton7-45 (superseeded by in-drivers extension? VK_EXT_graphics_pipeline_library)
+  #export RADV_PERFTEST=gpl # VK_EXT_graphics_pipeline_library support for AMD(RADV), for NVIDIA enabled in drivers since 515.49.10 without flag
+  : ${VKD3D_CONFIG:=no_upload_hvv}
+  export VKD3D_CONFIG
+
+  # Wine (usually preconfigured by proton)
+  : ${WINEFSYNC:=1}
+  export WINEFSYNC
+
+  # Epic Games Store
+  if [[ "${_G_runmode[*]}" =~ "__exec_eg" ]]; then
+    setup_legendary
+  fi
+
+}
+
+# Set-up environment
+arg_parse "${@}"
+
+# Set-up other
+if [ -z "$_G_runtime" ] || [ -z "$_G_prefix" ]; then
+  print_help
+  exit 0
+fi
+if [[ "${_G_runmode[*]}" =~ "__srpt" ]]; then
+  setup_srpt "${@}"
+fi
+if [[ "${_G_runmode[*]}" =~ "__silent" ]]; then
+  suffix="> /dev/null 2>&1"
+fi
+if [[ "${_G_runmode[*]}" =~ "__mango" ]]; then
+  export MANGOHUD=1
+fi
+if [[ "${_G_runmode[*]}" =~ "__local" ]]; then
+  setup_network_block
+fi
+if [ ! -z "$_G_root" ]; then
+  cd "$_G_root" # change working dir to game root directory (as expected on windows)
+fi
+
+# Setup environment variables
+setup_environment
+main_exec="'$_G_runtime/proton'"
+if [[ "${_G_runmode[*]}" =~ "__async" ]]; then
+  main_exec="$main_exec run"
+else
+  main_exec="$main_exec waitforexitandrun"
+fi
+test -n "$_G_exec" && main_exec="$main_exec '$_G_exec' $_G_args"
+
+# For test runs
+if [[ "${_G_runmode[*]}" =~ "__dry" ]]; then
+  echo "STEAM_COMPAT_SHADER_PATH $STEAM_COMPAT_SHADER_PATH"
+  echo "STEAM_COMPAT_MOUNTS $STEAM_COMPAT_MOUNTS"
+  echo "$prefix $main_exec $suffix : $STEAM_COMPAT_DATA_PATH"
+  exit 0
+fi
+
+# Run proton instance (creates prefix if applies)
+if [[ ! -e "$_G_prefix" ]] ; then
+  mkdir "$_G_prefix" || exit 1
+  eval "'$_G_runtime/proton' run wineboot --init"
+fi
+echo "$prefix : $main_exec : $suffix"
+echo "Working dir: $PWD"
+#read
+
+
+eval "$prefix $main_exec $suffix"
+
+
+[ ! -f "$_C_scriptDir/test_cases.sh" ] || . "$_C_scriptDir/test_cases.sh"
+#sleep 600
+
+
+echo "COMMAND: $prefix $main_exec $suffix"
+echo "STEAM_COMPAT_APP_ID: $STEAM_COMPAT_APP_ID"
+
+

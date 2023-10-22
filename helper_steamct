@@ -1,0 +1,47 @@
+#!/bin/bash
+# Helper::Steam Compatibility Tools
+# Expects below formats (called directly from steam client, supports any ambiguous application through chainloading)
+# Launch current game while forcing native support (games steam doesn't list such feature for)
+# $this waitforexitandrun /full/path/to/steam/game/binary
+# Launch arbitrary EP process while emulating being a steam game in question (chainloading, may enable Remote Play Together etc.)
+# $this waitforexitandrun /full/path/to/steam/game/binary "ENTRYPOINTNAME" --cd "ACTUALWORKINGDIR" ..ALLENTRYPOINTARGUMENTS..
+_C_scriptName="$(basename -- "$(realpath -- "$0")")"
+_C_scriptDir="$(dirname -- "$(realpath -- "$0")")"
+
+
+# Support for generic native execution (no steam helpers support)
+[ "$1" = "waitforexitandrun" ] || exit 0
+args=("${@:2}")
+
+# Support for routing arbitrary EP through current steam app (expects ep_* next to itself)
+argIndex=0
+for arg in "${args[@]}"; do
+  [[ "$arg" == "ep_"* ]] && break
+  ((argIndex++))
+done
+if [ "${#args[@]}" -ne "$argIndex" ]; then
+  # Set correct Entry Point
+  argSwap=("${args[@]}")
+  args=("$_C_scriptDir/${argSwap[$argIndex]}")
+  ((argIndex++))
+  
+  # Restore expected working directory (if any)
+  if [[ "${argSwap[$argIndex]}" == "--cd" ]]; then
+    ((argIndex++))
+    cd "${argSwap[$argIndex]}"
+    ((argIndex++))
+  fi
+
+  # Set corrent args for Entry Point
+  args+=("${argSwap[@]:$argIndex}")
+fi
+
+# for arg in "${args[@]}"; do
+#   echo "ARG: $arg"
+# done
+
+# Execute requested command
+echo "Command routed as [steam://run/$STEAM_COMPAT_APP_ID]:"
+echo "cd $(pwd)"
+echo "exec ${args[@]}"
+exec "${args[@]}"

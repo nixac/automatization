@@ -1,0 +1,361 @@
+#!/bin/bash
+# Dump directory expects dir structure like this Beatmania IIDX 26/contents;Beatmania IIDX 26/devel;
+
+##    Constant    ##
+_C_scriptDir="$(dirname -- "$(realpath -- "$0")")"
+_C_scriptName="$(basename -- "$(realpath -- "$0")")"
+# These constants are config overridable, but it is not recommended to do so (ex. hooks may not work)
+_C_dll_override="bm2dx.dll"
+_C_lightning_model="--iidxtdj"
+_C_rtname="proton-ge-8.16"
+_C_pfxname="u573_bm2dx_w8"
+# Audio native ASIO -iidxsounddevice is 27+ only
+_C_audio_asio1=(-iidxasio ASIO4ALL -iidxsounddevice asio)
+_C_audio_asio2=(-iidxasio FlexASIO -iidxsounddevice asio)
+_C_audio_asio3=(-iidxasio WineASIO -iidxsounddevice asio)
+# Audio native(dsound,24-)/wasapi(25+)
+_C_audio_native=(-audiohookdisable)
+_C_audio_wasapi=(-iidxsounddevice wasapi)
+# Audio spice dummy routing (25+ only, uses wasapi exclusive internally, which gets routed to specific audiobackend)
+_C_audio_dummy_asio=(-iidxsounddevice wasapi -audiodummy -audiobackend asio -asiodriverid 0)
+_C_audio_dummy_waveout=(-iidxsounddevice wasapi -audiodummy -audiobackend waveout)
+_C_audio_dummy_none=(-iidxsounddevice wasapi -audiodummy -audiobackend none)
+_C_audio_dummy_pipewire=(-iidxsounddevice wasapi -audiodummy -audiobackend pipewire)
+# Network spice builtin endpoint
+_C_net_dummy_maint=(-eamaint 1 -ea)
+_C_net_dummy_local=(-ea)
+
+##    Core    ##
+_G_root="$_C_scriptDir/../.steam/root"
+_G_ep=("$_C_scriptDir/ep_protonnix")
+_G_exec=""
+_G_args=()
+_G_style=""
+_G_dumps=""
+_G_debug=0
+
+##    Game config    ##
+_G_video="stable"
+_G_display=0
+_G_refresh_rate=0
+_G_fsr=-1
+_G_url=""
+_G_pcbid=""
+_G_hooks=()
+_G_devel=()
+
+
+print_help() {
+  cat <<EOF
+ep_nix:ver:bm2dx
+Usage: ${_C_scriptName} [EXiV] [opt-args]
+Available arguments:
+EXiV          style (numeric, required)
+--cfg         launch config tool (spicecfg)        
+--dbg         launch debug environment (--dbg2 if no value provided, available steps through OR blitting 1: spice, 2: x64dbg, 4: wine, 8: style reserved flag)
+--root        steam library root directory location override (this is where prefixes/runtimes are saved)
+--dumps       game dumps root directory location override (assuming steam library if not provided)
+--exec        run anything inside prefix (allows for running any application aside, you may provide arguments after --)
+--            arguments past this are passed to executable instead of defaults (read spice etc.)
+-h
+--help        show help
+
+Examples:
+${_C_scriptName} 26 --root /mnt/steamhdd --cfg (launches /mnt/steamhdd/steamapps/common/Beatmania IIDX 26/contents/spicecfg.exe)
+${_C_scriptName} 26  (launches $_G_root/steamapps/common/Beatmania IIDX 26/contents/spice64.exe)
+${_C_scriptName} 26 --exec /tmp/server.exe -- -p 1108 (runs /tmp/server.exe -p 1108 in IIDX26's environment)
+${_C_scriptName} 26 --dbg\$((4 | 1)) (launches second example with only additional wine and spice debug steps)
+EOF
+}
+
+abort() {
+  echo "[EXIT] Aborting due to failure at ${FUNCNAME[1]}($1)"
+  exit 1
+}
+
+arg_parse() {
+  while [ ! -z ${1+x} ]; do
+    case "$1" in
+    --help | -h)
+      shift
+      print_help
+      exit 0
+      ;;
+    --exec)
+      shift
+      _G_exec="$1"
+      shift
+      ;;
+    --cfg)
+      : ${_G_exec:="spicecfg.exe"}
+      shift
+      ;;
+    --dbg*)
+      _G_debug="${1:5}"
+      [ -n "$_G_debug" ] || _G_debug=2
+      shift
+      ;;
+    --root)
+      shift
+      : ${_G_root:="${1%/}"}
+      shift
+      ;;
+    --dumps)
+      shift
+      : ${_G_dumps:="${1%/}"}
+      shift
+      ;;
+    --)
+      shift
+      _G_args+=("${@}")
+      ;;
+    "")
+      shift
+      ;;
+    *)
+      [ -z "${1##*[!0-9]*}" ] || _G_style="$1"
+      [ -n "$_G_style" ] || {
+        echo "Unknown option: $1"
+        exit 2
+      }
+      shift
+      ;;
+    esac
+  done
+}
+
+cfg_parse() {
+  # Optional config
+  cfgjson="$(jq -c "." "$_G_dumps/Beatmania IIDX ${_G_style}/contents/prop/linux.json" 2>/dev/null || echo {})"
+
+  # Video
+  _G_video="$(jq -cr ".video.profile // \"$_G_video\"" <<<"$cfgjson")"
+  _G_display="$(jq -cr ".video.display // \"$_G_display\"" <<<"$cfgjson")"
+  _G_refresh_rate="$(jq -cr ".video.refresh_rate // \"$_G_refresh_rate\"" <<<"$cfgjson")"
+  _G_fsr="$(jq -cr ".video.fsr // \"$_G_fsr\"" <<<"$cfgjson")"
+
+  # Network
+  _G_url="$(jq -cr ".network.url // \"$_G_url\"" <<<"$cfgjson")"
+  _G_pcbid="$(jq -cr ".network.pcbid // \"$_G_pcbid\"" <<<"$cfgjson")"
+
+  # Extra
+  while read -r entry; do _G_hooks+=("$entry"); done < <(jq -cr '.extra.hooks // [] | .[]' <<<"$cfgjson")
+  while read -r entry; do _G_devel+=("$entry"); done < <(jq -cr '.extra.devel // [] | .[]' <<<"$cfgjson")
+  [ "$(jq -cr ".extra.lightning_support" <<<"$cfgjson")" == "false" ] && _C_lightning_model=""
+  _C_game_module="$(jq -cr ".extra.dll_override // \"$_C_game_module\"" <<<"$cfgjson")"
+  _C_rtname="$(jq -cr ".extra.rt_override // \"$_C_rtname\"" <<<"$cfgjson")"
+  _C_pfxname="$(jq -cr ".extra.pfx_override // \"$_C_pfxname\"" <<<"$cfgjson")"
+}
+
+monitor_by_id() {
+  if [ ! $(command -v ./monitor_by_id) ]; then
+    gcc "$_C_scriptDir/monitor_by_id.c" -o "$_C_scriptDir/monitor_by_id" -lX11 -lXrandr || return
+  fi
+  "$_C_scriptDir/monitor_by_id" $1
+}
+
+args_iidx22() {
+  # dummy audio unsupported, fullscreen working fine
+  _G_args+=("${_C_audio_native[@]}")
+  [ "$_G_video" != "stable" ] || _G_args+=(-graphics-force-single-adapter)
+  [ "$_G_url" != "dummy" ] || _G_args+=("${_C_net_dummy_local[@]}")
+}
+
+args_iidx30() {
+  # pipewire supported, fullscreen partially? working subscreen
+  _G_args+=("${_C_audio_dummy_pipewire[@]}" "${_C_lightning_model[@]}" -nolegacy -touchemuforce)
+  [ "$_G_video" != "stable" ] || _G_args+=(-graphics-force-single-adapter)
+  [ "$_G_url" != "dummy" ] || _G_args+=("${_C_net_dummy_maint[@]}")
+}
+
+args_iidx29() {
+  # pipewire supported, fullscreen working subscreen
+  _G_args+=("${_C_audio_dummy_pipewire[@]}" "${_C_lightning_model[@]}" -nolegacy -touchemuforce)
+  [ "$_G_video" != "stable" ] || _G_args+=(-graphics-force-single-adapter)
+  [ "$_G_url" != "dummy" ] || _G_args+=("${_C_net_dummy_maint[@]}")
+}
+
+args_iidx28() {
+  if ((_G_debug & 8)); then
+    # Workaround for audio initializing for ALSA driver (not recommended)
+    #export PULSE_LATENCY_MSEC=10
+    export PIPEWIRE_LATENCY=411/44100
+    export FIX_RATE=44100
+    export FIX_CHANNELS="[ FL FR ]"
+    export FIX_FORMAT="S16LE"
+    rate=$(pw-metadata -n settings 0 clock.rate)
+    rate="${rate#*value:\'}"
+    rate="${rate%%\'*}"
+    pw-metadata -n settings 0 clock.force-rate 44100
+    #pw-metadata -n settings 0 clock.force-quantum 441
+    nohup bash -c "sleep 30; pw-metadata -n settings 0 clock.force-rate $rate; sleep 1; pw-metadata -n settings 0 clock.force-rate --delete;" >/dev/null 2>&1 &
+    # Results in desync prone audio with alsa, static with pulse
+    _G_args+=("${_C_audio_wasapi[@]}" "${_C_audio_native[@]}" "${_C_lightning_model[@]}")
+  else
+    # pipewire supported, fullscreen working subscreen
+    _G_args+=("${_C_audio_dummy_pipewire[@]}" "${_C_lightning_model[@]}" -nolegacy -touchemuforce)
+    [ "$_G_video" != "stable" ] || _G_args+=(-graphics-force-single-adapter)
+    [ "$_G_url" != "dummy" ] || _G_args+=("${_C_net_dummy_maint[@]}")
+  fi
+
+}
+
+args_iidx27() {
+  # pipewire supported, fullscreen working subscreen
+  _G_args+=("${_C_audio_dummy_pipewire[@]}" "${_C_lightning_model[@]}" -nolegacy -touchemuforce)
+  [ "$_G_video" != "stable" ] || _G_args+=(-graphics-force-single-adapter)
+  [ "$_G_url" != "dummy" ] || _G_args+=("${_C_net_dummy_maint[@]}")
+}
+
+args_iidx26() {
+  # pipewire supported, fullscreen breaks on window unfocus
+  _G_args+=("${_C_audio_dummy_pipewire[@]}")
+  [ "$_G_video" != "stable" ] || _G_args+=(-w)
+  [ "$_G_url" != "dummy" ] || _G_args+=("${_C_net_dummy_maint[@]}")
+}
+
+args_iidx25() {
+  # pipewire supported, fullscreen breaks on window unfocus
+  _G_args+=("${_C_audio_dummy_pipewire[@]}")
+  [ "$_G_video" != "stable" ] || _G_args+=(-w)
+  [ "$_G_url" != "dummy" ] || _G_args+=("${_C_net_dummy_local[@]}")
+}
+
+gen_args() {
+  # Skip for override (--) mode
+  [ "${#_G_args[@]}" -eq 0 ] || {
+    _G_ep+=(--args "${_G_args[*]}")
+    return 0
+  }
+
+  # Basic
+  _G_args+=(-io -iidx -modules modules "$_C_dll_override")
+
+  # Style
+  if [[ $(type -t "args_iidx${_G_style}") == function ]]; then
+    "args_iidx${_G_style}"
+  else
+    _G_args+=("${_C_net_dummy[@]}" "${_C_audio_native[@]}")
+  fi
+
+  # Video
+  _G_args+=(-monitor $_G_display)
+  [ "$_G_refresh_rate" -gt 0 ] && _G_args+=(-graphics-force-refresh $_G_refresh_rate)
+  if [ "$_G_video" = "force_window" ]; then
+    _G_args+=(-w)
+  elif [ "$_G_video" = "force_fullscreen" ]; then
+    _G_args+=(-graphics-force-single-adapter)
+  fi
+
+  # Network
+  [ -n "$_G_url" ] && [ "$_G_url" != "dummy" ] && _G_args+=(-url "$_G_url")
+  [ -n "$_G_pcbid" ] && _G_args+=(-p "$_G_pcbid")
+
+  # Hooks
+  for hook in "${_G_hooks[@]}"; do _G_args+=(-k "$hook"); done
+
+  # Devel
+  ((_G_debug & 1)) && _G_args+=(${_G_devel[@]})
+  if ((_G_debug & 2)); then
+    # _REV: could write line directly into db/*.cmdline instead
+    echo "[INFO] x64dbg session argument recommendation: '${_G_args[*]} -w'"
+  else
+    _G_ep+=(--args "${_G_args[*]}")
+  fi
+
+}
+
+gen_base() {
+  # Core setup
+  styledir="$_G_dumps/Beatmania IIDX ${_G_style}"
+  patchid="0005731108"
+  if [ "$_G_style" -lt "25" ]; then
+    arch=32
+  else
+    arch=64
+  fi
+
+  # Proton setup
+  [ -n "$LD_LIBRARY_PATH" ] && LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:"
+  [ -n "$WINEDLLPATH" ] && LD_LIBRARY_PATH="${WINEDLLPATH}:"
+  LD_LIBRARY_PATH="${LD_LIBRARY_PATH}${styledir}/contents/modules"
+  WINEDLLPATH="${WINEDLLPATH}${styledir}/contents/modules"
+  export WINEDLLPATH
+  export LD_LIBRARY_PATH
+  if ((_G_debug & 4)); then
+    : ${PROTON_LOG_DIR:="$styledir/contents"}
+    : ${PROTON_LOG:=1}
+    : ${WINEDEBUG:="+loaddll,+module"}
+    export WINEDEBUG
+    export PROTON_LOG
+    export PROTON_LOG_DIR
+    echo "[INFO] Proton log file: '$PROTON_LOG_DIR/steam-${patchid}.log'"
+  fi
+  export PROTON_STYLE_PATCH="$PROTON_STYLE_PATCH:$_G_style"
+
+  # Video fixes (AMD FSR, NVidia VSync)
+  WINE_FULLSCREEN_FSR=0
+  [ -z ${__GL_SYNC_DISPLAY_DEVICE+x} ] && __GL_SYNC_DISPLAY_DEVICE="$(monitor_by_id $_G_display)"
+  if [ "$_G_fsr" -ge 0 ]; then
+    WINE_FULLSCREEN_FSR=1
+    export WINE_FULLSCREEN_FSR_STRENGTH=$_G_fsr
+    if [ "$_G_style" -ge "30" ]; then
+      export WINE_FULLSCREEN_FSR_CUSTOM_MODE=1920x1080
+    elif [ "$_G_style" -ge "20" ]; then
+      export WINE_FULLSCREEN_FSR_CUSTOM_MODE=1280x720
+    else
+      export WINE_FULLSCREEN_FSR_CUSTOM_MODE=640x480
+    fi
+  fi
+  export WINE_FULLSCREEN_FSR
+  export __GL_SYNC_DISPLAY_DEVICE
+
+  # Debug/normal environment generation
+  if ((_G_debug & 2)); then
+    styledir="$styledir/devel/debug/x64dbg/x${arch}"
+    [ -n "$_G_exec" ] || _G_exec="x${arch}dbg.exe"
+  else
+    styledir="$styledir/contents"
+    [ -n "$_G_exec" ] || if [ "$arch" -eq "32" ]; then _G_exec="spice.exe"; else _G_exec="spice${arch}.exe"; fi
+  fi
+
+  # Apply environment
+  cd "$styledir" || abort "INVALID PATH"
+  _G_ep+=(--exec "$_G_exec" --uniqueid "$patchid" --runtime "$_G_root/steamapps/common/$_C_rtname" --prefix "$_G_root/steamapps/compatdata/$_C_pfxname" --steam-dir "$_G_root")
+}
+
+sanity_check() {
+  # IIDX
+  [ -n "$_G_style" ] || abort "INVALID STYLE"
+  [ -n "$_G_dumps" ] || _G_dumps="$_G_root/steamapps/common"
+  [ -d "$_G_dumps" ] || abort "INVALID PATH"
+
+  # Proton
+  [ -d "$_G_root/steamapps/common" ] || abort "INVALID PATH"
+  [ -d "$_G_root/steamapps/compatdata" ] || abort "INVALID PATH"
+
+  # Manual features warnings
+  [ -z ${__GL_SYNC_DISPLAY_DEVICE+x} ] || echo "[WARN] User envar override detected, if game runs at wrong framerates, try unsetting __GL_SYNC_DISPLAY_DEVICE"
+
+  # Test only
+  echo "_G_display: $_G_display"
+  echo "_G_refresh_rate: $_G_refresh_rate"
+  echo "_G_fsr: $_G_fsr"
+  echo "_G_url: $_G_url"
+  echo "_G_pcbid: $_G_pcbid"
+  echo "_G_hooks[${#_G_hooks[@]}]: ${_G_hooks[*]}"
+  echo "_G_devel[${#_G_devel[@]}]: ${_G_devel[*]}"
+
+}
+
+# Set-up environment
+arg_parse "${@}"
+cfg_parse "${@}"
+sanity_check
+
+# command generation
+gen_base
+gen_args
+
+#abort "__GL_SYNC_DISPLAY_DEVICE=$__GL_SYNC_DISPLAY_DEVICE ${_G_ep[*]}"
+exec "${_G_ep[@]}"
