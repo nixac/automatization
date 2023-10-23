@@ -23,17 +23,26 @@ def main():
         print(f"gamefix: no patch available for {err}")
 
 def iidx_30():
-    # explicit to keep constant behaviour with other games (iidx27)
-    util.set_environment("WINEDLLOVERRIDES", "d3dcompiler_43,d3dx9_43=b,n")
+    # probably qpro etc., shader compilation fails for D3DXAssembleShader() - crash with missing callback Direct3DShaderValidatorCreate()
+    util.protontricks("d3dcompiler_43")
+    util.protontricks("d3dx9_43")
+    # this exact override needed for subscreen to be created
+    util.set_environment("WINEDLLOVERRIDES", "d3dcompiler_43=n,b")
 
 
 def iidx_29():
-    # explicit to keep constant behaviour with other games (iidx27)
-    util.set_environment("WINEDLLOVERRIDES", "d3dcompiler_43,d3dx9_43=b,n")
+    # probably qpro etc., shader compilation fails for D3DXAssembleShader() - crash with missing callback Direct3DShaderValidatorCreate()
+    util.protontricks("d3dcompiler_43")
+    util.protontricks("d3dx9_43")
+    # this exact override needed for subscreen to be created
+    util.set_environment("WINEDLLOVERRIDES", "d3dcompiler_43=n,b")
 
 def iidx_28():
-    # explicit to keep constant behaviour with other games (iidx27)
-    util.set_environment("WINEDLLOVERRIDES", "d3dcompiler_43,d3dx9_43=b,n")
+    # probably qpro etc., shader compilation fails for D3DXAssembleShader() - crash with missing callback Direct3DShaderValidatorCreate()
+    util.protontricks("d3dcompiler_43")
+    util.protontricks("d3dx9_43")
+    # this exact override needed for subscreen to be created
+    util.set_environment("WINEDLLOVERRIDES", "d3dcompiler_43=n,b")
 
 
 def iidx_27():

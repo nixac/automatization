@@ -1,0 +1,10 @@
+#!/bin/bash
+shopt -s globstar
+
+
+# Patch html
+read -p "This action may modify all .html files at '$PWD'"
+for html in **/*.html ; do
+  # Override relative links to open in current tab instead
+  sed -i 's~href="patcher/" target="_blank"~href="patcher/"~g' "$html"
+done
